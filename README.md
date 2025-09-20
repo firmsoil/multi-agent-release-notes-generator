@@ -159,6 +159,21 @@ release_notes_package/
 
 ---
 
+## GitHub Actions Integration
+
+You can automate release note generation using GitHub Actions so that every time a new tag is pushed, your multi-agent system generates release notes automatically.  
+
+### How It Works
+
+- The workflow triggers whenever a new tag is pushed.  
+- Automatically determines the previous tag (`START_COMMIT`) and current tag (`END_COMMIT`).  
+- Generates release notes using your multi-agent system.  
+- Commits the updated `release_notes.txt` back to the repository.  
+
+This setup ensures your release notes are always up-to-date and fully automated.
+
+---
+
 ## Contributing
 
 Contributions are welcome!  
