@@ -1,4 +1,4 @@
-# Multi-Agent Release Notes Generator
+# Multi-Agent AI Release Notes Generator
 
 [![Release Notes](https://img.shields.io/badge/Release-Notes-blue.svg)](https://github.com/yourusername/repo)  
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)  
