@@ -3,7 +3,7 @@
 [![Release Notes](https://img.shields.io/badge/Release-Notes-blue.svg)](https://github.com/yourusername/repo)  
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)  
 
-> Generate clear, useful, and engaging release notes from GitHub commits, PRs, and diffs using a collaborative multi-agent AI system based on Google Claude / Google ADK.
+> Generate clear, useful, and engaging release notes from GitHub commits, PRs, and diffs using a collaborative multi-agent AI system based on Google Claude / GADK.
 
 ---
 
