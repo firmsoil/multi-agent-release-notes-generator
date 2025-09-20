@@ -139,8 +139,9 @@ Sample output:
 
 ```
 release_notes_package/
-├── samples/                   # Example commits, diffs, and PRs for testing
-├── release_notes_agents.py     # Main orchestration script
+├── .github/workflows           # GitHub Actions workflow
+├── samples/                    # Example commits, diffs, and PRs for testing
+├── release_notes_agents.py     # Main orchestration agent(s)
 ├── generate_release_notes.sh   # Shell script for automated GitHub runs
 ├── .env                        # Environment variables (GITHUB_TOKEN, GENAI_API_KEY)
 ├── requirements.txt            # Python dependencies
