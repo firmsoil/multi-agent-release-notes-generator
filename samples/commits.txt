@@ -1,0 +1,6 @@
+Fix: resolve crash when profile picture is missing
+Add: CSV export for account reports
+Perf: reduce DB query latency in billing service
+chore: update dependencies [skip ci]
+Fix: handle empty state in onboarding flow
+Refactor: simplify payment retry logic

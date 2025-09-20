@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  release-notes:
+    build: .
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GENAI_API_KEY=${GENAI_API_KEY}
+    volumes:
+      - .:/app
+    command: >
+      --mode local --commits samples/commits.txt --diff samples/diff.txt --prs samples/prs.txt --version v0.1 --product LocalTest

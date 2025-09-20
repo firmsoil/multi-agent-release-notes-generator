@@ -1,0 +1,8 @@
+Task: Identify functional/technical changes (bug fixes, performance gains, new features) and return a short high-level summary of improvements.
+fix(ha): Add clouddriver-ro-deck to HA tests (#3995)
+* fix(outbound): Fix up more PR comments. Add --test_wait_on_services flag.
+* fix(outbound): Add missing flag for --native_base_url.
+* fix(outbound): Add additional comment about NATIVE_BASE_URL.
+fix(outbound): Add ability to impersonate service account to get bearer token. (#4082)
+* fix(validation): Remove unnecessary parathenses.
+* fix(appengine): Fix debug log.

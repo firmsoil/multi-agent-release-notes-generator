@@ -1,0 +1,8 @@
+PR #102: Fix crash when avatar missing
+This PR adds a defensive check to avoid None avatar values that caused a crash in user profile.
+
+PR #107: Add CSV export for account reports
+Adds a new export endpoint and small frontend button to download account reports as CSV.
+
+PR #110: Performance improvement in billing queries
+Batches multiple DB queries into one to reduce latency under high load.
