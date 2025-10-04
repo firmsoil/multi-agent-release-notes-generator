@@ -152,15 +152,6 @@ release_notes_package/
 
 ---
 
-## Multi-Agent Architecture:
-
-- Commit Curator Agent: Selects user-facing commits.
-- Change Diff Analyzer Agent: Identifies technical and functional improvements.
-- PR Context Agent: Extracts the intent/rationale for code changes.
-- Release Notes Builder Agent: Composes a polished, story-like release note from all agent outputs.
-
----
-
 ## Environment Variables
 
 | Variable         | Description                                   |
