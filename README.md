@@ -14,7 +14,8 @@
 - [Installation](#installation)  
 - [Usage](#usage)  
 - [Example Output](#example-output)  
-- [Project Structure](#project-structure)  
+- [Project Structure](#project-structure)
+- [ Multi-Agent Architecture](#multi-agent-architecture)
 - [Environment Variables](#environment-variables)  
 - [Contributing](#contributing)  
 - [License](#license)  
@@ -148,6 +149,15 @@ release_notes_package/
 ├── Dockerfile                  # Optional Docker build
 └── README.md                   # Project documentation
 ```
+
+---
+
+## Multi-Agent Architecture:
+
+- Commit Curator Agent: Selects user-facing commits.
+- Change Diff Analyzer Agent: Identifies technical and functional improvements.
+- PR Context Agent: Extracts the intent/rationale for code changes.
+- Release Notes Builder Agent: Composes a polished, story-like release note from all agent outputs.
 
 ---
 
