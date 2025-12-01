@@ -14,7 +14,10 @@ async function processChangesInBatches(results, stats) {
             
             if (result.status === 200) {
                 stats.published++;
-                console.log(`[${change.seq}] 📦 Package: **${change.id}** @ v${result.version}`);
+                // Display package with version and publish time
+                const displayVersion = change.version || result.version;
+                const publishTime = change.publishTime ? ` (published: ${change.publishTime})` : '';
+                console.log(`[${change.seq}] 📦 Package: **${change.id}** @ v${displayVersion}${publishTime}`);
                 return { type: 'published', change, result };
             } else if (result.status === 404) {
                 stats.deleted++;
@@ -40,10 +43,11 @@ const fetch = require('node-fetch').default;
 
 const NPM_CHANGES_URL = 'https://replicate.npmjs.com/registry/_changes';
 const NPM_REGISTRY_URL = 'https://registry.npmjs.org';
-const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const BATCH_LIMIT = 100; // Reduced to 100 for faster processing
-const MINUTES_TO_LOOK_BACK = 1; // Set to 1 minute for testing
+const HOURS_TO_LOOK_BACK = 120; // Start 120 hours ago
+const TIME_WINDOW_MINUTES = 5; // 5 minute window
 const MAX_CONCURRENT_REQUESTS = 10; // Limit concurrent API calls
+const POLL_INTERVAL_MS = 5 * 60 * 1000; // Poll every 5 minutes for new changes
 
 /**
  * Fetches package details from the npm registry to get version info
@@ -65,12 +69,16 @@ async function getPackageVersion(packageName) {
 }
 
 /**
- * Polls the npm changes feed for updates
+ * Polls the npm changes feed for updates within a rolling time window
  */
 async function pollChanges(sinceSeq, stats) {
     try {
+        // Calculate the current rolling time window
+        const now = Date.now();
+        const windowStart = now - (HOURS_TO_LOOK_BACK * 60 * 60 * 1000);
+        const windowEnd = windowStart + (TIME_WINDOW_MINUTES * 60 * 1000);
+        
         const url = `${NPM_CHANGES_URL}?since=${sinceSeq}&limit=${BATCH_LIMIT}`;
-        console.log(`\n🔄 Polling changes since sequence ${sinceSeq}...`);
         
         const response = await fetch(url);
         if (!response.ok) {
@@ -82,17 +90,67 @@ async function pollChanges(sinceSeq, stats) {
         const results = data.results || [];
         const newLastSeq = data.last_seq;
         
-        console.log(`📦 Received ${results.length} changes (new last_seq: ${newLastSeq})`);
-        
         if (results.length === 0) {
-            console.log('✅ No new changes detected');
             return newLastSeq;
         }
         
-        // Process changes with concurrency control
-        await processChangesInBatches(results, stats);
+        // Filter results to only include packages published within our rolling time window
+        const filteredResults = [];
+        let debugCount = 0;
+        const maxDebugSamples = 3; // Show details for first 3 packages
         
-        console.log(`📊 Batch Stats: ${stats.published} published | ${stats.deleted} deleted | ${stats.errors} errors`);
+        for (const change of results) {
+            // Fetch package info to check publish time
+            try {
+                const pkgResponse = await fetch(`${NPM_REGISTRY_URL}/${change.id}`);
+                if (pkgResponse.ok) {
+                    const pkgData = await pkgResponse.json();
+                    
+                    // Get the latest version to check its publish time
+                    const distTags = pkgData['dist-tags'];
+                    const latestVersion = distTags && distTags.latest;
+                    
+                    // DEBUG: Show sample package details
+                    if (debugCount < maxDebugSamples) {
+                        console.log(`\n  🔍 DEBUG Sample ${debugCount + 1}: ${change.id}`);
+                        console.log(`     Latest version: ${latestVersion || 'N/A'}`);
+                        if (latestVersion && pkgData.time && pkgData.time[latestVersion]) {
+                            const publishTime = new Date(pkgData.time[latestVersion]).toISOString();
+                            console.log(`     Published at: ${publishTime}`);
+                            console.log(`     Window start: ${new Date(windowStart).toISOString()}`);
+                            console.log(`     Window end:   ${new Date(windowEnd).toISOString()}`);
+                            console.log(`     In window? ${new Date(pkgData.time[latestVersion]).getTime() >= windowStart && new Date(pkgData.time[latestVersion]).getTime() <= windowEnd}`);
+                        } else {
+                            console.log(`     No publish time available`);
+                        }
+                        debugCount++;
+                    }
+                    
+                    if (latestVersion && pkgData.time && pkgData.time[latestVersion]) {
+                        const publishTime = new Date(pkgData.time[latestVersion]).getTime();
+                        
+                        // Check if the latest version was published within our rolling window
+                        if (publishTime >= windowStart && publishTime <= windowEnd) {
+                            // Add version info to the change object
+                            change.version = latestVersion;
+                            change.publishTime = new Date(publishTime).toISOString();
+                            filteredResults.push(change);
+                        }
+                    }
+                }
+            } catch (err) {
+                // Skip packages we can't check
+                continue;
+            }
+        }
+        
+        console.log(`📦 Received ${results.length} changes, ${filteredResults.length} within rolling time window (${new Date(windowStart).toISOString()} to ${new Date(windowEnd).toISOString()})`);
+        
+        if (filteredResults.length > 0) {
+            // Process changes with concurrency control
+            await processChangesInBatches(filteredResults, stats);
+            console.log(`📊 Running Stats: ${stats.published} published | ${stats.deleted} deleted | ${stats.errors} errors`);
+        }
         
         return newLastSeq;
         
@@ -103,7 +161,7 @@ async function pollChanges(sinceSeq, stats) {
 }
 
 /**
- * Calculates the starting sequence based on minutes to look back
+ * Calculates the initial starting sequence
  */
 async function calculateStartSequence() {
     try {
@@ -124,17 +182,12 @@ async function calculateStartSequence() {
             throw new Error(`Could not parse sequence number component: ${currentSeqString}`);
         }
         
-        // For initial testing, start from current sequence
-        // In production, you might want to look back further
-        const estimatedChangesPerMinute = 1000; // More realistic estimate
-        const offset = estimatedChangesPerMinute * MINUTES_TO_LOOK_BACK;
-        const startSeqNumber = Math.max(0, currentSeqNumber - offset);
-        
         console.log(`2. Current Seq: ${currentSeqNumber}`);
-        console.log(`3. Starting from Seq: ${startSeqNumber} (${MINUTES_TO_LOOK_BACK} mins ago, offset: ${offset})`);
+        console.log(`3. Monitoring window: ${HOURS_TO_LOOK_BACK} hours ago + ${TIME_WINDOW_MINUTES} minutes (rolling)`);
         console.log("--------------------------------------------------");
         
-        return startSeqNumber;
+        // Start from current sequence and look forward
+        return currentSeqNumber;
         
     } catch (error) {
         console.error('🚨 Failed to calculate start sequence:', error.message);
@@ -143,24 +196,30 @@ async function calculateStartSequence() {
 }
 
 /**
- * Main watcher function that polls continuously
+ * Main watcher function that continuously monitors the rolling time window
  */
 async function startWatcher() {
-    let currentSeq;
-    const stats = { published: 0, deleted: 0, errors: 0 };
-    
     try {
-        // Calculate starting sequence
-        currentSeq = await calculateStartSequence();
+        // Get initial sequence to start monitoring from
+        const startSeq = await calculateStartSequence();
         
-        console.log(`4. Starting polling loop (interval: ${POLL_INTERVAL_MS / 1000}s)...\n`);
+        console.log(`4. Starting continuous monitoring (poll interval: ${POLL_INTERVAL_MS / 1000}s)...\n`);
+        
+        let currentSeq = startSeq;
         
         // Continuous polling loop
         while (true) {
-            currentSeq = await pollChanges(currentSeq, stats);
+            console.log(`\n🔄 Polling for new changes (current seq: ${currentSeq})...`);
             
-            // Wait for the polling interval
-            console.log(`\n⏳ Waiting ${POLL_INTERVAL_MS / 1000} seconds until next poll...`);
+            const newSeq = await pollChanges(currentSeq, stats);
+            
+            // Update sequence
+            if (newSeq !== currentSeq) {
+                currentSeq = newSeq;
+            }
+            
+            // Wait before next poll
+            console.log(`⏳ Waiting ${POLL_INTERVAL_MS / 1000} seconds until next poll...`);
             await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
         }
         
@@ -173,9 +232,19 @@ async function startWatcher() {
 // Handle graceful shutdown
 process.on('SIGINT', () => {
     console.log('\n\n👋 Stopping the watcher...');
-    console.log('📊 Final statistics will be shown on next poll cycle');
+    console.log('\n' + '='.repeat(50));
+    console.log('📊 FINAL STATISTICS');
+    console.log('='.repeat(50));
+    console.log(`Monitoring window: ${HOURS_TO_LOOK_BACK} hours ago + ${TIME_WINDOW_MINUTES} minutes (rolling)`);
+    console.log(`Published packages found: ${stats.published}`);
+    console.log(`Deleted packages filtered: ${stats.deleted}`);
+    console.log(`Errors encountered: ${stats.errors}`);
+    console.log('='.repeat(50));
     process.exit(0);
 });
+
+// Make stats accessible to SIGINT handler
+let stats = { published: 0, deleted: 0, errors: 0 };
 
 // Start the watcher
 startWatcher();
