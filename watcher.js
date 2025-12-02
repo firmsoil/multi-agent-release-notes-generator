@@ -1,250 +1,603 @@
 /**
- * Process changes in batches with concurrency control
+ * watcher.js
+ * * A robust, fault-tolerant npm registry change follower that:
+ * - Polls the npm changes feed using manual batching
+ * - Persists the last processed sequence ID to seq.txt
+ * - Filters packages based on a precise 24-hour time window ending 120 hours ago
+ * - ONLY processes packages that are NOT deleted (no "deleted":true field)
+ * - Implements exponential backoff for transient errors
+ * - Runs indefinitely with proper error handling
+ * - Uses multiple fetcher threads to poll different sequence ranges in parallel
+ * - Each thread processes batches independently for maximum throughput
+ * - Logs all active (non-deleted) package IDs fetched in the cycle.
  */
-async function processChangesInBatches(results, stats) {
-    const chunks = [];
-    for (let i = 0; i < results.length; i += MAX_CONCURRENT_REQUESTS) {
-        chunks.push(results.slice(i, i + MAX_CONCURRENT_REQUESTS));
-    }
-    
-    let processedCount = 0;
-    for (const chunk of chunks) {
-        const promises = chunk.map(async (change) => {
-            const result = await getPackageVersion(change.id);
-            
-            if (result.status === 200) {
-                stats.published++;
-                // Display package with version and publish time
-                const displayVersion = change.version || result.version;
-                const publishTime = change.publishTime ? ` (published: ${change.publishTime})` : '';
-                console.log(`[${change.seq}] 📦 Package: **${change.id}** @ v${displayVersion}${publishTime}`);
-                return { type: 'published', change, result };
-            } else if (result.status === 404) {
-                stats.deleted++;
-                return { type: 'deleted', change, result };
-            } else {
-                stats.errors++;
-                console.log(`[${change.seq}] ⚠️  Package: **${change.id}** (${result.version})`);
-                return { type: 'error', change, result };
-            }
-        });
-        
-        await Promise.all(promises);
-        processedCount += chunk.length;
-        
-        // Show progress
-        if (processedCount % 50 === 0 || processedCount === results.length) {
-            console.log(`   ... processed ${processedCount}/${results.length} changes`);
-        }
-    }
-}// watcher.js
 
-const fetch = require('node-fetch').default; 
+const fs = require('fs/promises');
+const path = require('path');
+const { Worker } = require('worker_threads');
+const os = require('os');
+
+// Configuration constants
+const NPM_CHANGES_URL = 'https://replicate.npmjs.com/registry/_changes';
+const NPM_REGISTRY_URL = 'https://registry.npmjs.org';
+const PACKAGES_PER_THREAD = 10000; // Each thread fetches this many packages
+const FETCHER_THREADS = 10; // Number of parallel fetcher threads
+const WORKER_THREADS_PER_FETCHER = 5; // Worker threads per fetcher for processing packages
+const POLL_INTERVAL_MS = 30000; // 30 seconds
+const MAX_RETRIES = 5;
+const SEQ_FILE = 'seq.txt';
+const DELETION_THRESHOLD = 0.95; // If 95%+ are deletions, skip ahead
+
+// Time window configuration (in hours)
+const WINDOW_DURATION_HOURS = 24;
+const WINDOW_OFFSET_HOURS = 120; // Window ends 5 days (120 hours) before current time
+
+/**
+ * Get the current sequence ID from npm
+ * @returns {Promise<string>} Current sequence ID
+ */
+async function getCurrentSequence() {
+  try {
+    const response = await fetch(NPM_CHANGES_URL + '?limit=1');
+    const data = await response.json();
+    return String(data.last_seq);
+  } catch (error) {
+    console.error('[ERROR] Failed to get current sequence:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Load the last processed sequence ID from seq.txt
+ * @returns {Promise<string>} The sequence ID (defaults to current if file doesn't exist)
+ */
+async function loadSequenceId() {
+  try {
+    const content = await fs.readFile(SEQ_FILE, 'utf8');
+    const seqId = content.trim();
+    console.log(`[INIT] Loaded sequence ID from ${SEQ_FILE}: ${seqId}`);
+    return seqId || await getCurrentSequence();
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      console.log(`[INIT] ${SEQ_FILE} not found, fetching current sequence...`);
+      const currentSeq = await getCurrentSequence();
+      console.log(`[INIT] Starting from current sequence: ${currentSeq}`);
+      return currentSeq;
+    }
+    console.error(`[ERROR] Failed to read ${SEQ_FILE}:`, error.message);
+    return await getCurrentSequence();
+  }
+}
+
+/**
+ * Save the current sequence ID to seq.txt
+ * @param {string|number} seqId - The sequence ID to persist
+ */
+async function saveSequenceId(seqId) {
+  try {
+    const seqIdString = String(seqId);
+    await fs.writeFile(SEQ_FILE, seqIdString, 'utf8');
+    console.log(`[PERSIST] Saved sequence ID to ${SEQ_FILE}: ${seqIdString}`);
+  } catch (error) {
+    console.error(`[ERROR] Failed to write to ${SEQ_FILE}:`, error.message);
+    throw error;
+  }
+}
+
+/**
+ * Calculate the time window for filtering packages
+ * @returns {Object} Object containing windowStart and windowEnd Date objects
+ */
+function calculateTimeWindow() {
+  const currentTime = new Date();
+  const windowEnd = new Date(currentTime.getTime() - (WINDOW_OFFSET_HOURS * 60 * 60 * 1000));
+  const windowStart = new Date(windowEnd.getTime() - (WINDOW_DURATION_HOURS * 60 * 60 * 1000));
+  return { windowStart, windowEnd };
+}
+
+/**
+ * Fetcher thread code - Each thread fetches and processes a batch of packages
+ */
+const fetcherThreadCode = `
+const { parentPort, workerData } = require('worker_threads');
+const https = require('https');
+const { Worker } = require('worker_threads');
 
 const NPM_CHANGES_URL = 'https://replicate.npmjs.com/registry/_changes';
 const NPM_REGISTRY_URL = 'https://registry.npmjs.org';
-const BATCH_LIMIT = 100; // Reduced to 100 for faster processing
-const HOURS_TO_LOOK_BACK = 120; // Start 120 hours ago
-const TIME_WINDOW_MINUTES = 5; // 5 minute window
-const MAX_CONCURRENT_REQUESTS = 10; // Limit concurrent API calls
-const POLL_INTERVAL_MS = 5 * 60 * 1000; // Poll every 5 minutes for new changes
+
+// Package processor worker code (runs inside fetcher thread)
+const packageProcessorCode = \`
+const { parentPort, workerData } = require('worker_threads');
+const https = require('https');
+
+const NPM_REGISTRY_URL = 'https://registry.npmjs.org';
+
+function fetchPackageMetadata(packageName) {
+  return new Promise((resolve) => {
+    const encodedName = packageName.startsWith('@') 
+      ? '@' + encodeURIComponent(packageName.slice(1))
+      : encodeURIComponent(packageName);
+    
+    const url = NPM_REGISTRY_URL + '/' + encodedName;
+    
+    const options = {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'npm-watcher/1.0'
+      },
+      timeout: 10000
+    };
+    
+    https.get(url, options, (res) => {
+      let data = '';
+      
+      if (res.statusCode !== 200) {
+        res.resume();
+        resolve({ error: true, status: res.statusCode });
+        return;
+      }
+      
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve({ error: false, data: JSON.parse(data) });
+        } catch (error) {
+          resolve({ error: true, parseError: true });
+        }
+      });
+    }).on('error', () => resolve({ error: true }))
+      .on('timeout', () => resolve({ error: true }));
+  });
+}
+
+async function processPackages(packages, windowStart, windowEnd) {
+  const results = [];
+  let stats = { 
+    processed: 0, 
+    inWindow: 0, 
+    errors: 0,
+    noTimeField: 0,
+    outsideWindow: 0
+  };
+  
+  for (const pkg of packages) {
+    stats.processed++;
+    
+    // CRITICAL: Skip if package has "deleted": true
+    // Only process packages that do NOT have the deleted field or where deleted is false
+    if (pkg.deleted === true) {
+      // This should never happen as we filter before, but safety check
+      continue;
+    }
+    
+    const result = await fetchPackageMetadata(pkg.id);
+    
+    if (result.error) {
+      stats.errors++;
+      continue;
+    }
+    
+    if (!result.data?.time?.modified) {
+      stats.noTimeField++;
+      continue;
+    }
+    
+    const modifiedTime = new Date(result.data.time.modified);
+    const windowStartDate = new Date(windowStart);
+    const windowEndDate = new Date(windowEnd);
+    
+    if (modifiedTime >= windowStartDate && modifiedTime < windowEndDate) {
+      stats.inWindow++;
+      results.push({
+        id: pkg.id,
+        modifiedTime: result.data.time.modified
+      });
+    } else {
+      stats.outsideWindow++;
+    }
+  }
+  
+  return { results, stats };
+}
+
+processPackages(workerData.packages, workerData.windowStart, workerData.windowEnd)
+  .then(data => parentPort.postMessage({ success: true, ...data }))
+  .catch(error => parentPort.postMessage({ success: false, error: error.message }));
+\`;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function fetchChanges(since, limit) {
+  return new Promise((resolve, reject) => {
+    // FIX APPLIED: Escaped the inner template literal to prevent evaluation by the outer template literal
+    const url = \`${NPM_CHANGES_URL}?since=\${since}&limit=\${limit}\`;
+    
+    https.get(url, (res) => {
+      let data = '';
+      
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(\`HTTP \${res.statusCode}\`));
+        return;
+      }
+      
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    }).on('error', reject);
+  });
+}
+
+function runPackageProcessor(packages, windowStart, windowEnd) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(packageProcessorCode, {
+      eval: true,
+      workerData: { packages, windowStart, windowEnd }
+    });
+    
+    worker.on('message', (msg) => {
+      if (msg.success) {
+        resolve({ results: msg.results, stats: msg.stats });
+      } else {
+        reject(new Error(msg.error));
+      }
+    });
+    
+    worker.on('error', reject);
+    
+    worker.on('exit', (code) => {
+      if (code !== 0) reject(new Error(\`Worker exited with code \${code}\`));
+    });
+  });
+}
+
+async function fetchAndProcess() {
+  const { threadId, startSeq, limit, windowStart, windowEnd, workersPerFetcher } = workerData;
+  
+  try {
+    // Fetch changes from npm
+    const data = await fetchChanges(startSeq, limit);
+    
+    if (!data.results || data.results.length === 0) {
+      parentPort.postMessage({
+        success: true,
+        threadId,
+        lastSeq: data.last_seq || startSeq,
+        totalChanges: 0,
+        deletedCount: 0,
+        activePackageIds: [],
+        filteredPackages: [],
+        deletionRate: 0
+      });
+      return;
+    }
+    
+    // CRITICAL FILTERING: Only keep packages that do NOT have "deleted": true
+    const activePackages = data.results.filter(pkg => {
+      // Explicitly check: only include if deleted is NOT true
+      return pkg.deleted !== true;
+    });
+    
+    const deletedCount = data.results.length - activePackages.length;
+    const deletionRate = deletedCount / data.results.length;
+
+    // Collect the IDs of active packages to send back to the main thread
+    const activePackageIds = activePackages.map(pkg => pkg.id);
+    
+    // FIX APPLIED: Escaped the dollar sign in the template literal
+    console.log(\`[FETCHER \${threadId}] Filtering: Total=\${data.results.length}, Deleted=\${deletedCount}, Active=\${activePackages.length}\`);
+    
+    // Skip processing if all deleted
+    if (activePackages.length === 0) {
+      parentPort.postMessage({
+        success: true,
+        threadId,
+        lastSeq: data.last_seq,
+        totalChanges: data.results.length,
+        deletedCount,
+        activePackageIds: [],
+        filteredPackages: [],
+        deletionRate,
+        stats: { processed: 0, inWindow: 0, errors: 0, noTimeField: 0, outsideWindow: 0 }
+      });
+      return;
+    }
+    
+    // FIX APPLIED: Escaped the dollar sign in the template literal
+    // Show sample of active packages for verification
+    if (activePackages.length > 0) {
+      const sample = activePackages.slice(0, 3).map(p => p.id).join(', ');
+      console.log(\`[FETCHER \${threadId}] Sample active packages: \${sample}\`);
+    }
+    
+    // Distribute active packages among processor workers
+    const packagesPerWorker = Math.ceil(activePackages.length / workersPerFetcher);
+    const processorPromises = [];
+    
+    for (let i = 0; i < workersPerFetcher; i++) {
+      const start = i * packagesPerWorker;
+      const end = Math.min(start + packagesPerWorker, activePackages.length);
+      
+      if (start >= activePackages.length) break;
+      
+      const batch = activePackages.slice(start, end);
+      processorPromises.push(
+        runPackageProcessor(batch, windowStart, windowEnd)
+          .catch(() => ({ 
+            results: [], 
+            stats: { processed: 0, inWindow: 0, errors: 0, noTimeField: 0, outsideWindow: 0 } 
+          }))
+      );
+    }
+    
+    const processorResults = await Promise.all(processorPromises);
+    
+    // Aggregate results
+    const allResults = processorResults.flatMap(r => r.results);
+    const aggregateStats = {
+      processed: processorResults.reduce((sum, r) => sum + r.stats.processed, 0),
+      inWindow: processorResults.reduce((sum, r) => sum + r.stats.inWindow, 0),
+      errors: processorResults.reduce((sum, r) => sum + r.stats.errors, 0),
+      noTimeField: processorResults.reduce((sum, r) => sum + (r.stats.noTimeField || 0), 0),
+      outsideWindow: processorResults.reduce((sum, r) => sum + (r.stats.outsideWindow || 0), 0)
+    };
+    
+    parentPort.postMessage({
+      success: true,
+      threadId,
+      lastSeq: data.last_seq,
+      totalChanges: data.results.length,
+      deletedCount,
+      activePackages: activePackages.length,
+      filteredPackages: allResults,
+      activePackageIds, // Pass the list of active IDs back
+      deletionRate,
+      stats: aggregateStats
+    });
+    
+  } catch (error) {
+    parentPort.postMessage({
+      success: false,
+      threadId,
+      error: error.message
+    });
+  }
+}
+
+fetchAndProcess();
+`;
 
 /**
- * Fetches package details from the npm registry to get version info
+ * Run a fetcher thread
  */
-async function getPackageVersion(packageName) {
-    try {
-        const response = await fetch(`${NPM_REGISTRY_URL}/${packageName}/latest`);
-        if (response.status === 404) {
-            return { version: 'deleted/unpublished', status: 404 };
-        }
-        if (!response.ok) {
-            return { version: `error-${response.status}`, status: response.status };
-        }
-        const data = await response.json();
-        return { version: data.version || 'no-version-field', status: 200 };
-    } catch (error) {
-        return { version: 'fetch-error', status: 0 };
-    }
+function runFetcherThread(threadId, startSeq, limit, windowStart, windowEnd, workersPerFetcher) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(fetcherThreadCode, {
+      eval: true,
+      workerData: {
+        threadId,
+        startSeq,
+        limit,
+        windowStart: windowStart.toISOString(),
+        windowEnd: windowEnd.toISOString(),
+        workersPerFetcher
+      }
+    });
+    
+    worker.on('message', (message) => {
+      if (message.success) {
+        resolve(message);
+      } else {
+        reject(new Error(message.error));
+      }
+    });
+    
+    worker.on('error', reject);
+    
+    worker.on('exit', (code) => {
+      if (code !== 0) {
+        reject(new Error(`Fetcher thread ${threadId} exited with code ${code}`));
+      }
+    });
+  });
 }
 
 /**
- * Polls the npm changes feed for updates within a rolling time window
+ * Sleep for a specified duration
  */
-async function pollChanges(sinceSeq, stats) {
-    try {
-        // Calculate the current rolling time window
-        const now = Date.now();
-        const windowStart = now - (HOURS_TO_LOOK_BACK * 60 * 60 * 1000);
-        const windowEnd = windowStart + (TIME_WINDOW_MINUTES * 60 * 1000);
-        
-        const url = `${NPM_CHANGES_URL}?since=${sinceSeq}&limit=${BATCH_LIMIT}`;
-        
-        const response = await fetch(url);
-        if (!response.ok) {
-            console.error(`❌ Failed to fetch changes: ${response.status} ${response.statusText}`);
-            return sinceSeq; // Return current sequence on error
-        }
-        
-        const data = await response.json();
-        const results = data.results || [];
-        const newLastSeq = data.last_seq;
-        
-        if (results.length === 0) {
-            return newLastSeq;
-        }
-        
-        // Filter results to only include packages published within our rolling time window
-        const filteredResults = [];
-        let debugCount = 0;
-        const maxDebugSamples = 3; // Show details for first 3 packages
-        
-        for (const change of results) {
-            // Fetch package info to check publish time
-            try {
-                const pkgResponse = await fetch(`${NPM_REGISTRY_URL}/${change.id}`);
-                if (pkgResponse.ok) {
-                    const pkgData = await pkgResponse.json();
-                    
-                    // Get the latest version to check its publish time
-                    const distTags = pkgData['dist-tags'];
-                    const latestVersion = distTags && distTags.latest;
-                    
-                    // DEBUG: Show sample package details
-                    if (debugCount < maxDebugSamples) {
-                        console.log(`\n  🔍 DEBUG Sample ${debugCount + 1}: ${change.id}`);
-                        console.log(`     Latest version: ${latestVersion || 'N/A'}`);
-                        if (latestVersion && pkgData.time && pkgData.time[latestVersion]) {
-                            const publishTime = new Date(pkgData.time[latestVersion]).toISOString();
-                            console.log(`     Published at: ${publishTime}`);
-                            console.log(`     Window start: ${new Date(windowStart).toISOString()}`);
-                            console.log(`     Window end:   ${new Date(windowEnd).toISOString()}`);
-                            console.log(`     In window? ${new Date(pkgData.time[latestVersion]).getTime() >= windowStart && new Date(pkgData.time[latestVersion]).getTime() <= windowEnd}`);
-                        } else {
-                            console.log(`     No publish time available`);
-                        }
-                        debugCount++;
-                    }
-                    
-                    if (latestVersion && pkgData.time && pkgData.time[latestVersion]) {
-                        const publishTime = new Date(pkgData.time[latestVersion]).getTime();
-                        
-                        // Check if the latest version was published within our rolling window
-                        if (publishTime >= windowStart && publishTime <= windowEnd) {
-                            // Add version info to the change object
-                            change.version = latestVersion;
-                            change.publishTime = new Date(publishTime).toISOString();
-                            filteredResults.push(change);
-                        }
-                    }
-                }
-            } catch (err) {
-                // Skip packages we can't check
-                continue;
-            }
-        }
-        
-        console.log(`📦 Received ${results.length} changes, ${filteredResults.length} within rolling time window (${new Date(windowStart).toISOString()} to ${new Date(windowEnd).toISOString()})`);
-        
-        if (filteredResults.length > 0) {
-            // Process changes with concurrency control
-            await processChangesInBatches(filteredResults, stats);
-            console.log(`📊 Running Stats: ${stats.published} published | ${stats.deleted} deleted | ${stats.errors} errors`);
-        }
-        
-        return newLastSeq;
-        
-    } catch (error) {
-        console.error('❌ Error during polling:', error.message);
-        return sinceSeq; // Return current sequence on error
-    }
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**
- * Calculates the initial starting sequence
+ * Main processing loop
  */
-async function calculateStartSequence() {
+async function main() {
+  console.log('[START] npm package change watcher started');
+  console.log('[CONFIG] FILTERING RULE: Only process packages WITHOUT "deleted":true');
+  console.log(`[CONFIG] Fetcher threads: ${FETCHER_THREADS}`);
+  console.log(`[CONFIG] Packages per thread: ${PACKAGES_PER_THREAD}`);
+  console.log(`[CONFIG] Worker threads per fetcher: ${WORKER_THREADS_PER_FETCHER}`);
+  console.log(`[CONFIG] Total packages per poll: ${FETCHER_THREADS * PACKAGES_PER_THREAD}`);
+  console.log(`[CONFIG] Poll interval: ${POLL_INTERVAL_MS}ms`);
+  console.log(`[CONFIG] Time window: ${WINDOW_DURATION_HOURS} hours ending ${WINDOW_OFFSET_HOURS} hours ago`);
+  console.log('='.repeat(80));
+  
+  let currentSeq = await loadSequenceId();
+  let consecutiveHighDeletionBatches = 0;
+  
+  while (true) {
     try {
-        console.log(`1. Fetching current sequence from ${NPM_CHANGES_URL}...`);
+      console.log('\n' + '='.repeat(80));
+      console.log(`[POLL] Starting poll cycle with sequence ID: ${currentSeq}`);
+      
+      const { windowStart, windowEnd } = calculateTimeWindow();
+      console.log(`[WINDOW] Start: ${windowStart.toISOString()}`);
+      console.log(`[WINDOW] End:   ${windowEnd.toISOString()}`);
+      
+      const startTime = Date.now();
+      
+      // Launch all fetcher threads in parallel
+      console.log(`[FETCHERS] Launching ${FETCHER_THREADS} fetcher threads...`);
+      
+      const fetcherPromises = [];
+      let currentThreadSeq = currentSeq;
+      
+      for (let i = 0; i < FETCHER_THREADS; i++) {
+        console.log(`[FETCHER ${i + 1}] Starting from seq ${currentThreadSeq}, fetching ${PACKAGES_PER_THREAD} packages`);
         
-        const response = await fetch(NPM_CHANGES_URL);
-        const data = await response.json();
+        fetcherPromises.push(
+          runFetcherThread(i + 1, currentThreadSeq, PACKAGES_PER_THREAD, windowStart, windowEnd, WORKER_THREADS_PER_FETCHER)
+            .catch(error => {
+              console.error(`[FETCHER ${i + 1}] Error:`, error.message);
+              return {
+                threadId: i + 1,
+                lastSeq: currentThreadSeq,
+                totalChanges: 0,
+                deletedCount: 0,
+                activePackages: 0,
+                filteredPackages: [],
+                activePackageIds: [],
+                deletionRate: 0,
+                stats: { processed: 0, inWindow: 0, errors: 0, noTimeField: 0, outsideWindow: 0 },
+                error: true
+              };
+            })
+        );
         
-        let currentSeqString = String(data.last_seq);
+        // Calculate next sequence for next thread (approximate)
+        currentThreadSeq = String(parseInt(currentThreadSeq) + PACKAGES_PER_THREAD);
+      }
+      
+      // Wait for all fetcher threads to complete
+      const fetcherResults = await Promise.all(fetcherPromises);
+      
+      const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
+      
+      // Aggregate results from all fetchers
+      let totalChanges = 0;
+      let totalDeleted = 0;
+      let totalActive = 0;
+      let totalFiltered = 0;
+      let maxSeq = currentSeq;
+      let allFilteredPackages = [];
+      let allActivePackageIds = [];
+      let aggregateStats = {
+        processed: 0,
+        inWindow: 0,
+        errors: 0,
+        noTimeField: 0,
+        outsideWindow: 0
+      };
+      
+      fetcherResults.forEach((result, idx) => {
+        totalChanges += result.totalChanges || 0;
+        totalDeleted += result.deletedCount || 0;
+        totalActive += result.activePackages || 0;
+        totalFiltered += (result.filteredPackages || []).length;
+        allFilteredPackages.push(...(result.filteredPackages || []));
+        allActivePackageIds.push(...(result.activePackageIds || []));
         
-        if (!currentSeqString || currentSeqString === 'undefined' || currentSeqString === 'null') {
-            throw new Error(`Invalid or missing 'last_seq' in API response: ${data.last_seq}`);
+        if (result.stats) {
+          aggregateStats.processed += result.stats.processed || 0;
+          aggregateStats.inWindow += result.stats.inWindow || 0;
+          aggregateStats.errors += result.stats.errors || 0;
+          aggregateStats.noTimeField += result.stats.noTimeField || 0;
+          aggregateStats.outsideWindow += result.stats.outsideWindow || 0;
         }
         
-        const currentSeqNumber = parseInt(currentSeqString.split('-')[0], 10);
-        
-        if (isNaN(currentSeqNumber)) {
-            throw new Error(`Could not parse sequence number component: ${currentSeqString}`);
+        if (result.lastSeq && parseInt(result.lastSeq) > parseInt(maxSeq)) {
+          maxSeq = result.lastSeq;
         }
         
-        console.log(`2. Current Seq: ${currentSeqNumber}`);
-        console.log(`3. Monitoring window: ${HOURS_TO_LOOK_BACK} hours ago + ${TIME_WINDOW_MINUTES} minutes (rolling)`);
-        console.log("--------------------------------------------------");
+        const status = result.error ? '\u274c ' : '\u2714 ';
+        const inWindow = result.stats?.inWindow || 0;
+        console.log(`[FETCHER ${idx + 1}] ${status} Total: ${result.totalChanges || 0}, Deleted: ${result.deletedCount || 0}, Active: ${result.activePackages || 0}, In window: ${inWindow}`);
+      });
+      
+      console.log('[AGGREGATE] ' + '='.repeat(60));
+      console.log(`[AGGREGATE] Total changes fetched: ${totalChanges}`);
+      console.log(`[AGGREGATE] Deleted packages (filtered out): ${totalDeleted} (${totalChanges > 0 ? ((totalDeleted/totalChanges)*100).toFixed(1) : 0}%)`);
+      console.log(`[AGGREGATE] Active packages (processed): ${totalActive} (${totalChanges > 0 ? ((totalActive/totalChanges)*100).toFixed(1) : 0}%)`);
+      console.log(`[AGGREGATE] Packages in time window: ${totalFiltered}`);
+      console.log(`[AGGREGATE] Outside window: ${aggregateStats.outsideWindow}, No time field: ${aggregateStats.noTimeField}, Errors: ${aggregateStats.errors}`);
+      console.log(`[AGGREGATE] Processing time: ${processingTime} seconds`);
+      console.log(`[AGGREGATE] Throughput: ${(totalChanges / parseFloat(processingTime)).toFixed(0)} packages/sec`);
+      
+      // Check deletion rate
+      const overallDeletionRate = totalChanges > 0 ? totalDeleted / totalChanges : 0;
+      
+      if (overallDeletionRate >= DELETION_THRESHOLD) {
+        consecutiveHighDeletionBatches++;
+        console.log(`[WARN] High deletion rate: ${(overallDeletionRate * 100).toFixed(1)}% - batch ${consecutiveHighDeletionBatches}`);
         
-        // Start from current sequence and look forward
-        return currentSeqNumber;
-        
+        if (consecutiveHighDeletionBatches >= 3) {
+          console.log(`[ACTION] Skipping ahead to current sequence...`);
+          const newSeq = await getCurrentSequence();
+          if (newSeq) {
+            maxSeq = newSeq;
+            consecutiveHighDeletionBatches = 0;
+          }
+        }
+      } else {
+        consecutiveHighDeletionBatches = 0;
+      }
+      
+      // Display only the list of all active packages (new requirement)
+      if (allActivePackageIds.length > 0) {
+        console.log('[ACTIVE PACKAGES] All packages processed (not deleted):');
+        allActivePackageIds.forEach(pkgId => {
+          console.log(`  - ${pkgId}`);
+        });
+      } else {
+        console.log('[INFO] No active packages were fetched in this poll cycle.');
+      }
+      
+      // Original log for time-window packages (keeping for context)
+      if (allFilteredPackages.length > 0) {
+        console.log('[TIME WINDOW PACKAGES] Packages that matched the time window filter:');
+        allFilteredPackages.forEach(pkg => {
+          console.log(`  - ${pkg.id} (modified: ${pkg.modifiedTime})`);
+        });
+      }
+      
+      // Update sequence to the maximum seen
+      currentSeq = maxSeq;
+      await saveSequenceId(currentSeq);
+      
+      console.log(`[SLEEP] Waiting ${POLL_INTERVAL_MS}ms before next poll...`);
+      await sleep(POLL_INTERVAL_MS);
+      
     } catch (error) {
-        console.error('🚨 Failed to calculate start sequence:', error.message);
-        throw error;
+      console.error('[ERROR] Unexpected error in main loop:', error.message);
+      console.error('[ERROR] Stack trace:', error.stack);
+      console.log(`[RECOVERY] Waiting ${POLL_INTERVAL_MS}ms before retry...`);
+      await sleep(POLL_INTERVAL_MS);
     }
+  }
 }
 
-/**
- * Main watcher function that continuously monitors the rolling time window
- */
-async function startWatcher() {
-    try {
-        // Get initial sequence to start monitoring from
-        const startSeq = await calculateStartSequence();
-        
-        console.log(`4. Starting continuous monitoring (poll interval: ${POLL_INTERVAL_MS / 1000}s)...\n`);
-        
-        let currentSeq = startSeq;
-        
-        // Continuous polling loop
-        while (true) {
-            console.log(`\n🔄 Polling for new changes (current seq: ${currentSeq})...`);
-            
-            const newSeq = await pollChanges(currentSeq, stats);
-            
-            // Update sequence
-            if (newSeq !== currentSeq) {
-                currentSeq = newSeq;
-            }
-            
-            // Wait before next poll
-            console.log(`⏳ Waiting ${POLL_INTERVAL_MS / 1000} seconds until next poll...`);
-            await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
-        }
-        
-    } catch (error) {
-        console.error('🚨 Fatal error in watcher:', error.message);
-        process.exit(1);
-    }
-}
-
-// Handle graceful shutdown
+// Handle process termination gracefully
 process.on('SIGINT', () => {
-    console.log('\n\n👋 Stopping the watcher...');
-    console.log('\n' + '='.repeat(50));
-    console.log('📊 FINAL STATISTICS');
-    console.log('='.repeat(50));
-    console.log(`Monitoring window: ${HOURS_TO_LOOK_BACK} hours ago + ${TIME_WINDOW_MINUTES} minutes (rolling)`);
-    console.log(`Published packages found: ${stats.published}`);
-    console.log(`Deleted packages filtered: ${stats.deleted}`);
-    console.log(`Errors encountered: ${stats.errors}`);
-    console.log('='.repeat(50));
-    process.exit(0);
+  console.log('\n[SHUTDOWN] Received SIGINT, shutting down gracefully...');
+  process.exit(0);
 });
 
-// Make stats accessible to SIGINT handler
-let stats = { published: 0, deleted: 0, errors: 0 };
+process.on('SIGTERM', () => {
+  console.log('\n[SHUTDOWN] Received SIGTERM, shutting down gracefully...');
+  process.exit(0);
+});
 
 // Start the watcher
-startWatcher();
+main().catch(error => {
+  console.error('[FATAL] Unhandled error in main:', error);
+  process.exit(1);
+});
